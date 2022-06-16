@@ -1,3 +1,12 @@
+"""
+retinafact + facenet
+人脸检测+图像截取+图像旋转+生成128向量
+注意:截取出来的图片经过旋转后,要填充灰条至大小为 [160,160,3], 这张图片会进行完整的Facenet预测过程,包括backbone
+
+retinaface_model_path, retinaface_backbone, facenet_model_path, facenet_backbone
+"""
+
+
 import time
 
 import cv2
@@ -11,10 +20,8 @@ from nets.facenet import Facenet
 from nets_retinaface.retinaface import RetinaFace
 from utils.anchors import Anchors
 from utils.config import cfg_mnet, cfg_re50
-from utils.utils import (Alignment_1, compare_faces, letterbox_image,
-                         preprocess_input)
-from utils.utils_bbox import (decode, decode_landm, non_max_suppression,
-                              retinaface_correct_boxes)
+from utils.utils import (Alignment_1, compare_faces, letterbox_image, preprocess_input)
+from utils.utils_bbox import (decode, decode_landm, non_max_suppression, retinaface_correct_boxes)
 
 
 #--------------------------------------#
@@ -31,7 +38,7 @@ def cv2ImgAddText(img, label, left, top, textColor=(255, 255, 255)):
     label = label.encode('utf-8')
     draw.text((left, top), str(label,'UTF-8'), fill=textColor, font=font)
     return np.asarray(img)
-    
+
 #--------------------------------------#
 #   一定注意backbone和model_path的对应。
 #   在更换facenet_model后，
@@ -67,7 +74,7 @@ class Retinaface(object):
         #   是否需要进行图像大小限制。
         #----------------------------------------------------------------------#
         "letterbox_image"       : True,
-        
+
         #----------------------------------------------------------------------#
         #   facenet训练完的权值路径
         #----------------------------------------------------------------------#
@@ -135,7 +142,7 @@ class Retinaface(object):
         #-------------------------------#
         #   载入模型与权值
         #-------------------------------#
-        self.net        = RetinaFace(cfg=self.cfg, phase='eval', pre_train=False).eval()
+        self.net        = RetinaFace(cfg=self.cfg, pre_train=False, mode='eval').eval()
         self.facenet    = Facenet(backbone=self.facenet_backbone, mode="predict").eval()
 
         print('Loading weights into state dict...')
@@ -153,7 +160,16 @@ class Retinaface(object):
             self.facenet = self.facenet.cuda()
         print('Finished!')
 
+    """编码人脸到数据库"""
     def encode_face_dataset(self, image_paths, names):
+        """
+        传入的每一张图片和名字都会被保存
+        image_paths: 所有图片路径
+        names:       对应图片的人名字
+        """
+        #---------------------------------------------------#
+        #   人脸编码列表,会被保存起来
+        #---------------------------------------------------#
         face_encodings = []
         for index, path in enumerate(tqdm(image_paths)):
             #---------------------------------------------------#
@@ -170,6 +186,8 @@ class Retinaface(object):
             im_height, im_width, _ = np.shape(image)
             #---------------------------------------------------#
             #   计算scale，用于将获得的预测框转换成原图的高宽
+            #   将小数形式转换为图片大小
+            #   长度分别为4和10,这样可以直接乘以预测结果即可
             #---------------------------------------------------#
             scale = [
                 np.shape(image)[1], np.shape(image)[0], np.shape(image)[1], np.shape(image)[0]
@@ -179,6 +197,10 @@ class Retinaface(object):
                 np.shape(image)[1], np.shape(image)[0], np.shape(image)[1], np.shape(image)[0],
                 np.shape(image)[1], np.shape(image)[0]
             ]
+
+            #---------------------------------------------------------#
+            #   letterbox_image可以给图像增加灰条，实现不失真的resize
+            #---------------------------------------------------------#
             if self.letterbox_image:
                 image = letterbox_image(image, [self.retinaface_input_shape[1], self.retinaface_input_shape[0]])
                 anchors = self.anchors
@@ -198,9 +220,14 @@ class Retinaface(object):
                     image               = image.cuda()
                     anchors             = anchors.cuda()
 
+                #---------------------------------------------------------#
+                #   传入网络进行预测
+                #   return: 框的调整参数,是否包含人脸,5个坐标点的调整参数
+                #---------------------------------------------------------#
                 loc, conf, landms = self.net(image)
                 #-----------------------------------------------------------#
-                #   对预测框进行解码
+                #   将预测结果进行解码和非极大抑制
+                #   return: [b, 4] 4指的是x1,y1,x2,y2
                 #-----------------------------------------------------------#
                 boxes   = decode(loc.data.squeeze(0), anchors, self.cfg['variance'])
                 #-----------------------------------------------------------#
@@ -209,17 +236,27 @@ class Retinaface(object):
                 conf    = conf.data.squeeze(0)[:, 1:2]
                 #-----------------------------------------------------------#
                 #   对人脸关键点进行解码
+                #   return: 5个坐标点 [b,10]
                 #-----------------------------------------------------------#
                 landms  = decode_landm(landms.data.squeeze(0), anchors, self.cfg['variance'])
 
                 #-----------------------------------------------------------#
                 #   对人脸检测结果进行堆叠
+                #   [0,1,2,3] 坐标
+                #   [4] 置信度
+                #   [5-14] 5个关键点坐标
                 #-----------------------------------------------------------#
                 boxes_conf_landms = torch.cat([boxes, conf, landms], -1)
+                #-----------------------------------------------------------#
+                #   非极大抑制
+                #-----------------------------------------------------------#
                 boxes_conf_landms = non_max_suppression(boxes_conf_landms, self.confidence)
 
+                #---------------------------------------------------#
+                #   如果没有预测框则跳过
+                #---------------------------------------------------#
                 if len(boxes_conf_landms) <= 0:
-                    print(names[index], "：未检测到人脸")
+                    print(names[index], ":未检测到人脸")
                     continue
                 #---------------------------------------------------------#
                 #   如果使用了letterbox_image的话，要把灰条的部分去除掉。
@@ -228,6 +265,9 @@ class Retinaface(object):
                     boxes_conf_landms = retinaface_correct_boxes(boxes_conf_landms, \
                         np.array([self.retinaface_input_shape[0], self.retinaface_input_shape[1]]), np.array([im_height, im_width]))
 
+            #---------------------------------------------------------#
+            #   坐标和关键点参数的预测值为0~1,转换为真实大小
+            #---------------------------------------------------------#
             boxes_conf_landms[:, :4] = boxes_conf_landms[:, :4] * scale
             boxes_conf_landms[:, 5:] = boxes_conf_landms[:, 5:] * scale_for_landmarks
 
@@ -253,6 +293,10 @@ class Retinaface(object):
             crop_img,_ = Alignment_1(crop_img,landmark)
 
             crop_img = np.array(letterbox_image(np.uint8(crop_img),(self.facenet_input_shape[1],self.facenet_input_shape[0])))/255
+            #---------------------------------------------------#
+            #   将截取的图像调整为 [160,160,3],这张图片会进行完整的Facenet预测过程,包括backbone,并归一化
+            #---------------------------------------------------#
+            crop_img = np.array(letterbox_image(np.uint8(crop_img),(self.facenet_input_shape[1],self.facenet_input_shape[0])))/255
             crop_img = crop_img.transpose(2, 0, 1)
             crop_img = np.expand_dims(crop_img,0)
             #---------------------------------------------------#
@@ -262,12 +306,14 @@ class Retinaface(object):
                 crop_img = torch.from_numpy(crop_img).type(torch.FloatTensor)
                 if self.cuda:
                     crop_img = crop_img.cuda()
-
+                # facenet进行预测
                 face_encoding = self.facenet(crop_img)[0].cpu().numpy()
+                # 添加进列表中
                 face_encodings.append(face_encoding)
 
-        np.save("model_data/{backbone}_face_encoding.npy".format(backbone=self.facenet_backbone),face_encodings)
-        np.save("model_data/{backbone}_names.npy".format(backbone=self.facenet_backbone),names)
+        #   保存,传入的每一张图片和名字都会被
+        np.save("model_data/{backbone}_face_encoding.npy".format(backbone=self.facenet_backbone), face_encodings)
+        np.save("model_data/{backbone}_names.npy".format(backbone=self.facenet_backbone), names)
 
     #---------------------------------------------------#
     #   检测图片
@@ -291,6 +337,8 @@ class Retinaface(object):
         im_height, im_width, _ = np.shape(image)
         #---------------------------------------------------#
         #   计算scale，用于将获得的预测框转换成原图的高宽
+        #   将小数形式转换为图片大小
+        #   长度分别为4和10,这样可以直接乘以预测结果即可
         #---------------------------------------------------#
         scale = [
             np.shape(image)[1], np.shape(image)[0], np.shape(image)[1], np.shape(image)[0]
@@ -325,24 +373,37 @@ class Retinaface(object):
 
             #---------------------------------------------------------#
             #   传入网络进行预测
+            #   return: 框的调整参数,是否包含人脸,5个坐标点的调整参数
             #---------------------------------------------------------#
             loc, conf, landms = self.net(image)
+
             #---------------------------------------------------#
-            #   Retinaface网络的解码，最终我们会获得预测框
             #   将预测结果进行解码和非极大抑制
+            #   return: [b, 4] 4指的是x1,y1,x2,y2
             #---------------------------------------------------#
             boxes   = decode(loc.data.squeeze(0), anchors, self.cfg['variance'])
-
-            conf    = conf.data.squeeze(0)[:, 1:2]
-            
+            #-----------------------------------------------------------#
+            #   获得预测结果的置信度
+            #-----------------------------------------------------------#
+            conf    = conf.data.squeeze(0)[:, 1:2]  # [0] 是背景 [1]是人脸的概率 1:2取出1
+            #-----------------------------------------------------------#
+            #   对人脸关键点进行解码
+            #   return: 5个坐标点 [b,10]
+            #-----------------------------------------------------------#
             landms  = decode_landm(landms.data.squeeze(0), anchors, self.cfg['variance'])
-            
+
             #-----------------------------------------------------------#
             #   对人脸检测结果进行堆叠
+            #   [0,1,2,3] 坐标
+            #   [4] 置信度
+            #   [5-14] 5个关键点坐标
             #-----------------------------------------------------------#
             boxes_conf_landms = torch.cat([boxes, conf, landms], -1)
+            #-----------------------------------------------------------#
+            #   非极大抑制
+            #-----------------------------------------------------------#
             boxes_conf_landms = non_max_suppression(boxes_conf_landms, self.confidence)
-        
+
             #---------------------------------------------------#
             #   如果没有预测框则返回原图
             #---------------------------------------------------#
@@ -356,38 +417,61 @@ class Retinaface(object):
                 boxes_conf_landms = retinaface_correct_boxes(boxes_conf_landms, \
                     np.array([self.retinaface_input_shape[0], self.retinaface_input_shape[1]]), np.array([im_height, im_width]))
 
+            #---------------------------------------------------------#
+            #   坐标和关键点参数的预测值为0~1,转换为真实大小
+            #---------------------------------------------------------#
             boxes_conf_landms[:, :4] = boxes_conf_landms[:, :4] * scale
             boxes_conf_landms[:, 5:] = boxes_conf_landms[:, 5:] * scale_for_landmarks
 
         #---------------------------------------------------#
         #   Retinaface检测部分-结束
         #---------------------------------------------------#
-        
+
         #-----------------------------------------------#
         #   Facenet编码部分-开始
+        #   截取出来的人脸会行进完整的Facenet编码,包括特征提取
+        #-----------------------------------------------#
+        #-----------------------------------------------#
+        #   存放每一张人脸的编码信息
         #-----------------------------------------------#
         face_encodings = []
         for boxes_conf_landm in boxes_conf_landms:
             #----------------------#
-            #   图像截取，人脸矫正
+            #   不清楚选出来的最大是什么    
             #----------------------#
             boxes_conf_landm    = np.maximum(boxes_conf_landm, 0)
+            #----------------------#
+            #   图像截取
+            #   Retinaface的输出
+            #   1,3代表y轴; 0,2代表x轴
+            #----------------------#
             crop_img            = np.array(old_image)[int(boxes_conf_landm[1]):int(boxes_conf_landm[3]), int(boxes_conf_landm[0]):int(boxes_conf_landm[2])]
+            #----------------------#
+            #   变换人脸关键点坐标,原坐标相对于原图的左上角,新坐标相对于截取的框的左上角
+            #----------------------#
             landmark            = np.reshape(boxes_conf_landm[5:],(5,2)) - np.array([int(boxes_conf_landm[0]),int(boxes_conf_landm[1])])
+            #----------------------#
+            #   人脸矫正
+            #----------------------#
             crop_img, _         = Alignment_1(crop_img, landmark)
 
             #----------------------#
-            #   人脸编码
+            #   人脸编码 facenet计算
             #----------------------#
-            crop_img = np.array(letterbox_image(np.uint8(crop_img),(self.facenet_input_shape[1],self.facenet_input_shape[0])))/255
-            crop_img = np.expand_dims(crop_img.transpose(2, 0, 1),0)
+            #---------------------------------------------------#
+            #   将截取的图像调整为 [160,160,3],这张图片会进行完整的Facenet预测过程,包括backbone
+            #   之后归一化,调整通道
+            #----------------------#
+            crop_img = np.array(letterbox_image(np.uint8(crop_img),(self.facenet_input_shape[1],self.facenet_input_shape[0]))) / 255
+            crop_img = np.expand_dims(crop_img.transpose(2, 0, 1), 0)
             with torch.no_grad():
                 crop_img = torch.from_numpy(crop_img).type(torch.FloatTensor)
                 if self.cuda:
                     crop_img = crop_img.cuda()
 
                 #-----------------------------------------------#
-                #   利用facenet_model计算长度为128特征向量
+                #   利用facenet_model计算长度为128特征向量  [0] 每次放入一张图片,所以取0即可
+                #   存储起来
                 #-----------------------------------------------#
                 face_encoding = self.facenet(crop_img)[0].cpu().numpy()
                 face_encodings.append(face_encoding)
@@ -402,21 +486,27 @@ class Retinaface(object):
         for face_encoding in face_encodings:
             #-----------------------------------------------------#
             #   取出一张脸并与数据库中所有的人脸进行对比，计算得分
+            #   compare_faces返回: 距离小的 True / False, 所有距离
             #-----------------------------------------------------#
             matches, face_distances = compare_faces(self.known_face_encodings, face_encoding, tolerance = self.facenet_threhold)
-            name = "Unknown"
+            name = "Unknown"    # 定义人脸不知道
             #-----------------------------------------------------#
             #   取出这个最近人脸的评分
-            #   取出当前输入进来的人脸，最接近的已知人脸的序号
+            #   取出当前输入进来的人脸，最接近的已知人脸的序号(距离最小值)
             #-----------------------------------------------------#
             best_match_index = np.argmin(face_distances)
-            if matches[best_match_index]: 
+            # 这个序号的距离小于阈值,就是找出为True的
+            if matches[best_match_index]:
+                # 找到人名
                 name = self.known_face_names[best_match_index]
             face_names.append(name)
         #-----------------------------------------------#
         #   人脸特征比对-结束
         #-----------------------------------------------#
-        
+
+        #-----------------------------------------------#
+        #   图片绘制
+        #-----------------------------------------------#
         for i, b in enumerate(boxes_conf_landms):
             text = "{:.4f}".format(b[4])
             b = list(map(int, b))
@@ -432,15 +522,15 @@ class Retinaface(object):
             #---------------------------------------------------#
             #   b[5]-b[14]为人脸关键点的坐标
             #---------------------------------------------------#
-            cv2.circle(old_image, (b[5], b[6]), 1, (0, 0, 255), 4)
-            cv2.circle(old_image, (b[7], b[8]), 1, (0, 255, 255), 4)
-            cv2.circle(old_image, (b[9], b[10]), 1, (255, 0, 255), 4)
+            cv2.circle(old_image, (b[5],  b[6]),  1, (0, 0, 255), 4)
+            cv2.circle(old_image, (b[7],  b[8]),  1, (0,255,255), 4)
+            cv2.circle(old_image, (b[9],  b[10]), 1, (255,0,255), 4)
             cv2.circle(old_image, (b[11], b[12]), 1, (0, 255, 0), 4)
             cv2.circle(old_image, (b[13], b[14]), 1, (255, 0, 0), 4)
-            
+
             name = face_names[i]
             # font = cv2.FONT_HERSHEY_SIMPLEX
-            # cv2.putText(old_image, name, (b[0] , b[3] - 15), font, 0.75, (255, 255, 255), 2) 
+            # cv2.putText(old_image, name, (b[0] , b[3] - 15), font, 0.75, (255, 255, 255), 2)
             #--------------------------------------------------------------#
             #   cv2不能写中文，加上这段可以，但是检测速度会有一定的下降。
             #   如果不是必须，可以换成cv2只显示英文。
@@ -510,15 +600,15 @@ class Retinaface(object):
             boxes   = decode(loc.data.squeeze(0), anchors, self.cfg['variance'])
 
             conf    = conf.data.squeeze(0)[:, 1:2]
-            
+
             landms  = decode_landm(landms.data.squeeze(0), anchors, self.cfg['variance'])
-            
+
             #-----------------------------------------------------------#
             #   对人脸检测结果进行堆叠
             #-----------------------------------------------------------#
             boxes_conf_landms = torch.cat([boxes, conf, landms], -1)
             boxes_conf_landms = non_max_suppression(boxes_conf_landms, self.confidence)
-            
+
         if len(boxes_conf_landms)>0:
             #---------------------------------------------------------#
             #   如果使用了letterbox_image的话，要把灰条的部分去除掉。
@@ -533,7 +623,7 @@ class Retinaface(object):
             #---------------------------------------------------#
             #   Retinaface检测部分-结束
             #---------------------------------------------------#
-            
+
             #-----------------------------------------------#
             #   Facenet编码部分-开始
             #-----------------------------------------------#
@@ -581,13 +671,13 @@ class Retinaface(object):
                 #   取出当前输入进来的人脸，最接近的已知人脸的序号
                 #-----------------------------------------------------#
                 best_match_index = np.argmin(face_distances)
-                if matches[best_match_index]: 
+                if matches[best_match_index]:
                     name = self.known_face_names[best_match_index]
                 face_names.append(name)
             #-----------------------------------------------#
             #   人脸特征比对-结束
             #-----------------------------------------------#
-        
+
         t1 = time.time()
         for _ in range(test_interval):
             with torch.no_grad():
@@ -602,15 +692,15 @@ class Retinaface(object):
                 boxes   = decode(loc.data.squeeze(0), anchors, self.cfg['variance'])
 
                 conf    = conf.data.squeeze(0)[:, 1:2]
-                
+
                 landms  = decode_landm(landms.data.squeeze(0), anchors, self.cfg['variance'])
-                
+
                 #-----------------------------------------------------------#
                 #   对人脸检测结果进行堆叠
                 #-----------------------------------------------------------#
                 boxes_conf_landms = torch.cat([boxes, conf, landms], -1)
                 boxes_conf_landms = non_max_suppression(boxes_conf_landms, self.confidence)
-            
+
             if len(boxes_conf_landms) > 0:
                 #---------------------------------------------------------#
                 #   如果使用了letterbox_image的话，要把灰条的部分去除掉。
@@ -625,7 +715,7 @@ class Retinaface(object):
                 #---------------------------------------------------#
                 #   Retinaface检测部分-结束
                 #---------------------------------------------------#
-                
+
                 #-----------------------------------------------#
                 #   Facenet编码部分-开始
                 #-----------------------------------------------#
@@ -673,7 +763,7 @@ class Retinaface(object):
                     #   取出当前输入进来的人脸，最接近的已知人脸的序号
                     #-----------------------------------------------------#
                     best_match_index = np.argmin(face_distances)
-                    if matches[best_match_index]: 
+                    if matches[best_match_index]:
                         name = self.known_face_names[best_match_index]
                     face_names.append(name)
                 #-----------------------------------------------#

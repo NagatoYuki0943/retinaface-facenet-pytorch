@@ -18,7 +18,10 @@ def letterbox_image(image, size):
     new_image   = np.ones([size[1], size[0], 3]) * 128
     new_image[(h-nh)//2:nh+(h-nh)//2, (w-nw)//2:nw+(w-nw)//2] = image
     return new_image
-    
+
+#---------------------------------------------------#
+#   归一化
+#---------------------------------------------------#
 def preprocess_input(image):
     image -= np.array((104, 117, 123),np.float32)
     return image
@@ -27,49 +30,69 @@ def preprocess_input(image):
 #   计算人脸距离
 #---------------------------------#
 def face_distance(face_encodings, face_to_compare):
+    """
+    known_face_encodings:   已知所有人脸特征向量
+    face_encoding_to_check: 检测的人脸
+    """
     if len(face_encodings) == 0:
         return np.empty((0))
-    # (n, )
+    # 求欧式距离
+    # (n, ) n代表已知所有人脸和待检测人脸的欧式距离
     return np.linalg.norm(face_encodings - face_to_compare, axis=1)
 
 #---------------------------------#
 #   比较人脸
 #---------------------------------#
 def compare_faces(known_face_encodings, face_encoding_to_check, tolerance=1):
-    dis = face_distance(known_face_encodings, face_encoding_to_check) 
+    """
+    known_face_encodings:   已知所有人脸特征向量
+    face_encoding_to_check: 检测的人脸
+    tolerance:  宽容度,小于它才行
+    """
+    dis = face_distance(known_face_encodings, face_encoding_to_check)
+    # 距离小的 True / False, 所有距离
     return list(dis <= tolerance), dis
 
 #-------------------------------------#
 #   人脸对齐
 #-------------------------------------#
 def Alignment_1(img,landmark):
+    """
+    x: 上下眼睛x轴差
+    y: 上下眼睛y轴差
+    return: 新图片,新的人脸关键点
+    """
     if landmark.shape[0]==68:
-        x = landmark[36,0] - landmark[45,0]
-        y = landmark[36,1] - landmark[45,1]
+        x = landmark[36, 0] - landmark[45, 0]
+        y = landmark[36, 1] - landmark[45, 1]
     elif landmark.shape[0]==5:
-        x = landmark[0,0] - landmark[1,0]
-        y = landmark[0,1] - landmark[1,1]
+        x = landmark[0, 0] - landmark[1, 0]
+        y = landmark[0, 1] - landmark[1, 1]
     # 眼睛连线相对于水平线的倾斜角
     if x==0:
         angle = 0
-    else: 
-        # 计算它的弧度制
-        angle = math.atan(y/x)*180/math.pi
+    else:
+        # 计算它的弧度制,变为角度制
+        angle = math.atan(y / x) * 180 / math.pi
 
-    center = (img.shape[1]//2, img.shape[0]//2)
-    
+    # 计算截取后的图片中心,宽高除以2
+    center = (img.shape[1] // 2, img.shape[0] // 2)
+
+    # 旋转矩阵
     RotationMatrix = cv2.getRotationMatrix2D(center, angle, 1)
     # 仿射函数
-    new_img = cv2.warpAffine(img,RotationMatrix,(img.shape[1],img.shape[0])) 
+    new_img = cv2.warpAffine(img,RotationMatrix,(img.shape[1],img.shape[0]))
 
+    # 对人脸关键点进行对齐
     RotationMatrix = np.array(RotationMatrix)
     new_landmark = []
     for i in range(landmark.shape[0]):
-        pts = []    
-        pts.append(RotationMatrix[0,0]*landmark[i,0]+RotationMatrix[0,1]*landmark[i,1]+RotationMatrix[0,2])
-        pts.append(RotationMatrix[1,0]*landmark[i,0]+RotationMatrix[1,1]*landmark[i,1]+RotationMatrix[1,2])
+        pts = []
+        pts.append(RotationMatrix[0, 0] * landmark[i, 0] + RotationMatrix[0, 1] * landmark[i, 1] + RotationMatrix[0, 2])
+        pts.append(RotationMatrix[1, 0] * landmark[i, 0] + RotationMatrix[1, 1] * landmark[i, 1] + RotationMatrix[1, 2])
         new_landmark.append(pts)
 
     new_landmark = np.array(new_landmark)
 
+    # 返回新图片和新的人脸关键点
     return new_img, new_landmark
