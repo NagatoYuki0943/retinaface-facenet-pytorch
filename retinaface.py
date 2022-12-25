@@ -144,12 +144,13 @@ class Retinaface(object):
         #-------------------------------#
         self.net        = RetinaFace(cfg=self.cfg, pre_train=False, mode='eval').eval()
         self.facenet    = Facenet(backbone=self.facenet_backbone, mode="predict").eval()
+        device          = torch.device('cuda' if self.cuda else 'cpu')
 
         print('Loading weights into state dict...')
-        state_dict = torch.load(self.retinaface_model_path)
+        state_dict = torch.load(self.retinaface_model_path, map_location=device)
         self.net.load_state_dict(state_dict)
 
-        state_dict = torch.load(self.facenet_model_path)
+        state_dict = torch.load(self.facenet_model_path, map_location=device)
         self.facenet.load_state_dict(state_dict, strict=False)
 
         if self.cuda:
